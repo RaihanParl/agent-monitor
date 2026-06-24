@@ -1,22 +1,32 @@
-# Agent Mirror Dashboard
+# Agent Session Mirror
 
-Mirrors local Hermes, OpenCode, and Cursor activity into one web UI so you can watch agent progress from another device or browser while keeping Telegram minimal.
+**Local Agent Observatory** — a dark, glassy dashboard that mirrors Hermes, OpenCode, and Cursor activity into one live web UI.
 
-![Agent Mirror Dashboard](docs/dashboard.png)
+![Agent Session Mirror dashboard](docs/dashboard.png)
 
-## Features
+Watch agent progress from another device or browser while keeping Telegram minimal. The UI refreshes every 2.5 seconds and stays read-only.
 
-- Shows running agent-related processes with running/idle activity state
-- Shows tmux sessions with active/idle state
-- Reads Hermes session and message data from `~/.hermes/state.db`
-- Reads OpenCode session, message, and part data from `~/.local/share/opencode/opencode.db`
-- Reads Cursor agent transcripts and terminal snapshots from `~/.cursor/projects`
-- Polls every 2.5 seconds for near-live updates
+## What you get
+
+- **Three-pane layout**: session rail, chat stage, and runtime drawer
+- **Unified sessions** from Hermes, OpenCode, and Cursor with source-colored badges
+- **Chat-style timeline** with flat user bubbles, markdown rendering, and tool/reasoning/terminal events
+- **Runtime panel** for running/idle processes, tmux sessions, and secondary activity
+- **Source filters** for All, Hermes, OpenCode, and Cursor
+
+## Data sources
+
+| Source | Location |
+|--------|----------|
+| Hermes | `~/.hermes/state.db` |
+| OpenCode | `~/.local/share/opencode/opencode.db` |
+| Cursor | `~/.cursor/projects` transcripts and terminal snapshots |
 
 ## Quick start
 
 ```bash
-cd agent-mirror-dashboard
+git clone git@github.com:RaihanParl/agent-monitor.git
+cd agent-monitor
 python3 app.py
 ```
 
@@ -47,7 +57,7 @@ Then open `http://YOUR_MAC_IP:8787` from your phone or another machine on the sa
 
 - Read-only: this dashboard does not send commands to agents.
 - It reads whatever those tools persist locally, including reasoning and tool traces when available.
-- Cursor visibility depends on what Cursor wrote into transcript JSONL and terminal snapshot files.
+- Cursor visibility depends on transcript JSONL and terminal snapshot files on disk.
 
 ## Regenerate the README screenshot
 
