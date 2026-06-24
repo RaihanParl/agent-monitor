@@ -873,6 +873,20 @@ def clean_cursor_visible_text(text):
     return clean_text(text)
 
 
+def is_generated_cursor_user_text(text):
+    if not text:
+        return False
+    lowered = text.lower()
+    generated_markers = (
+        'briefly inform the user about the task result and perform any follow-up actions',
+        'implement the plan as specified, it is attached for your reference',
+        "to-do's from the plan have already been created",
+        'do not edit the plan file itself',
+        'mark them as in_progress as you work',
+    )
+    return any(marker in lowered for marker in generated_markers)
+
+
 def cursor_message_text(entry):
     message = entry.get('message') or {}
     parts = message.get('content') or []
@@ -906,20 +920,27 @@ def normalize_cursor_sessions(cursor):
                 media = extract_media_assets((entry.get('message') or {}).get('content') or [])
                 if not text and not media:
                     continue
-                if role == 'assistant' and text:
+                display_role = role
+                kind = 'message'
+                title = 'Agent response' if role == 'assistant' else role_label(role)
+                if role == 'user' and is_generated_cursor_user_text(text):
+                    display_role = 'system'
+                    kind = 'instruction'
+                    title = 'Cursor task instruction'
+                if display_role == 'assistant' and text:
                     assistant_count += 1
                 timeline.append(make_event(
                     entry_ts,
-                    role,
-                    'message',
-                    'Agent response' if role == 'assistant' else role_label(role),
+                    display_role,
+                    kind,
+                    title,
                     clip(text or cursor_entry_preview(entry), 220),
                     body=text,
                     raw=pretty_json(entry),
                     display_ts=display_ts,
                     sort_key=sort_key,
                     media=media,
-                    accent=role,
+                    accent=display_role,
                 ))
             else:
                 kind = entry.get('type', 'event')
@@ -1037,8 +1058,8 @@ INDEX_HTML = """<!doctype html>
       --danger: #fb7185;
       --assistant: rgba(15, 23, 42, .94);
       --assistant-line: rgba(148, 163, 184, .18);
-      --user: linear-gradient(135deg, rgba(34, 211, 166, .95), rgba(59, 130, 246, .92));
-      --user-line: rgba(125, 211, 252, .32);
+      --user: rgba(18, 32, 42, .94);
+      --user-line: rgba(34, 211, 166, .22);
       --tool: rgba(30, 41, 59, .78);
       --tool-line: rgba(96, 165, 250, .2);
       --reasoning: rgba(49, 46, 129, .35);
@@ -1220,7 +1241,7 @@ INDEX_HTML = """<!doctype html>
     }
     .app-shell {
       display: grid;
-      grid-template-columns: 360px minmax(0, 1fr) 320px;
+      grid-template-columns: 360px minmax(0, 1fr) minmax(280px, 320px);
       height: calc(100vh - 72px);
       min-height: 0;
       position: relative;
@@ -1364,7 +1385,7 @@ INDEX_HTML = """<!doctype html>
     }
     .session-hero { padding: 18px; margin-bottom: 16px; }
     .hero-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-    .hero-title { margin-top: 10px; font-size: clamp(18px, 2vw, 24px); line-height: 1.15; }
+    .hero-title { margin-top: 10px; font-size: clamp(18px, 2vw, 24px); line-height: 1.15; overflow-wrap: anywhere; }
     .hero-path { max-width: 760px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-2); }
     .summary-row { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-top: 14px; }
     .summary-chip {
@@ -1409,8 +1430,6 @@ INDEX_HTML = """<!doctype html>
       align-self: flex-end;
       background: var(--user);
       border-color: var(--user-line);
-      color: #ecfeff;
-      box-shadow: 0 20px 44px rgba(34, 211, 166, .16);
     }
     .event.tool { background: var(--tool); border-color: var(--tool-line); }
     .event.reasoning { background: var(--reasoning); border-color: var(--reasoning-line); }
@@ -1430,17 +1449,16 @@ INDEX_HTML = """<!doctype html>
     .event-title { color: var(--text-strong); font-weight: 800; }
     .chat-timeline .event-head { padding: 13px 16px 0; }
     .chat-timeline .event-head .badge { display: none; }
-    .chat-timeline .event.user .event-title, .chat-timeline .event.user .event-head { color: rgba(255,255,255,.86); }
     .event-time { color: var(--muted-2); font: 600 11px var(--mono); white-space: nowrap; }
-    .chat-timeline .event.user .event-time { color: rgba(236, 254, 255, .74); }
     .event-preview {
       padding: 10px 16px 16px;
       word-break: break-word;
+      overflow-wrap: anywhere;
       line-height: 1.65;
       font-size: 14px;
       color: var(--text);
     }
-    .chat-timeline .event.user .event-preview { color: #ecfeff; }
+    .chat-timeline .event.user .event-preview { color: var(--text); }
     .event-preview.plain { white-space: pre-wrap; }
     .event-preview.empty { color: var(--muted); font-style: italic; }
     .markdown-body { white-space: normal; }
@@ -1474,7 +1492,6 @@ INDEX_HTML = """<!doctype html>
       border-radius: 7px;
       padding: .12em .38em;
     }
-    .chat-timeline .event.user .markdown-body code { color: #ecfeff; background: rgba(2, 6, 23, .2); border-color: rgba(255,255,255,.18); }
     .markdown-body pre {
       margin: 0 0 .9em;
       padding: 13px 14px;
