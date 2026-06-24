@@ -2,8 +2,8 @@ Agent Mirror Dashboard
 
 What it does
 - Mirrors local Hermes, OpenCode, and Cursor activity into one web UI.
-- Shows running agent-related processes.
-- Shows tmux sessions.
+- Shows running agent-related processes with running/idle activity state.
+- Shows tmux sessions with active/idle state.
 - Reads Hermes session/message data from ~/.hermes/state.db.
 - Reads OpenCode session/message/part data from ~/.local/share/opencode/opencode.db.
 - Reads Cursor agent transcripts and terminal snapshots from ~/.cursor/projects.

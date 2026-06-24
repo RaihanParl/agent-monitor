@@ -20,6 +20,9 @@ REFRESH_MS = int(os.environ.get('AGENT_MIRROR_REFRESH_MS', '2500'))
 MAX_SESSIONS = int(os.environ.get('AGENT_MIRROR_MAX_SESSIONS', '8'))
 MAX_MESSAGES = int(os.environ.get('AGENT_MIRROR_MAX_MESSAGES', '64'))
 MAX_TERMINAL_LINES = int(os.environ.get('AGENT_MIRROR_MAX_TERMINAL_LINES', '80'))
+PROCESS_ACTIVE_CPU = float(os.environ.get('AGENT_MIRROR_PROCESS_ACTIVE_CPU', '1.0'))
+TMUX_ACTIVE_SECONDS = int(os.environ.get('AGENT_MIRROR_TMUX_ACTIVE_SECONDS', '45'))
+SESSION_ACTIVE_SECONDS = int(os.environ.get('AGENT_MIRROR_SESSION_ACTIVE_SECONDS', '120'))
 
 
 def now_iso():
@@ -177,6 +180,77 @@ def run_cmd(cmd):
         return str(exc)
 
 
+def classify_process_status(stat, cpu):
+    stat = (stat or '').upper()
+    try:
+        cpu_value = float(cpu or 0)
+    except ValueError:
+        cpu_value = 0.0
+    if 'R' in stat or cpu_value >= PROCESS_ACTIVE_CPU:
+        return 'running'
+    return 'idle'
+
+
+def classify_tmux_status(activity_ts, attached):
+    try:
+        activity = int(activity_ts or 0)
+    except ValueError:
+        activity = 0
+    if attached in ('1', 'true', True):
+        return 'running'
+    if activity and (datetime.now().timestamp() - activity) <= TMUX_ACTIVE_SECONDS:
+        return 'running'
+    return 'idle'
+
+
+def classify_session_status(source, session, updated_at):
+    if source == 'Hermes':
+        if not session.get('ended_at'):
+            return 'running'
+        return 'idle'
+
+    if source == 'OpenCode':
+        for msg in reversed(session.get('messages') or []):
+            for part in reversed(msg.get('parts') or []):
+                pdata = part.get('data') or {}
+                if pdata.get('type') != 'tool':
+                    continue
+                tool_status = str((pdata.get('state') or {}).get('status') or '').lower()
+                if tool_status in ('running', 'pending', 'in_progress', 'started'):
+                    return 'running'
+        if is_recent_timestamp(updated_at, SESSION_ACTIVE_SECONDS):
+            return 'running'
+        return 'idle'
+
+    if source == 'Cursor':
+        messages = session.get('messages') or []
+        if messages:
+            last = messages[-1]
+            if last.get('type') == 'turn_ended':
+                return 'idle'
+        if is_recent_timestamp(updated_at, SESSION_ACTIVE_SECONDS):
+            return 'running'
+        return 'idle'
+
+    return 'idle'
+
+
+def is_recent_timestamp(value, max_age_seconds):
+    if not value:
+        return False
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1_000_000_000_000:
+            ts /= 1000.0
+    else:
+        text = str(value)
+        try:
+            ts = datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            return False
+    return (datetime.now().timestamp() - ts) <= max_age_seconds
+
+
 def get_processes():
     cmd = [
         'bash', '-lc',
@@ -190,26 +264,46 @@ def get_processes():
         parts = line.split(None, 10)
         if len(parts) < 11:
             continue
+        stat = parts[7]
+        cpu = parts[2]
         rows.append({
             'user': parts[0],
             'pid': parts[1],
-            'cpu': parts[2],
+            'cpu': cpu,
             'mem': parts[3],
+            'stat': stat,
+            'status': classify_process_status(stat, cpu),
             'started': parts[8],
             'time': parts[9],
             'command': parts[10],
         })
+    rows.sort(key=lambda item: (0 if item['status'] == 'running' else 1, -float(item['cpu'] or 0)))
     return rows
 
 
 def get_tmux_sessions():
-    raw = run_cmd(['bash', '-lc', 'tmux ls 2>/dev/null || true'])
+    fmt_cmd = (
+        "tmux list-sessions -F '#{session_name}\t#{session_activity}\t#{session_attached}' "
+        "2>/dev/null || true"
+    )
+    raw = run_cmd(['bash', '-lc', fmt_cmd])
     sessions = []
     for line in raw.splitlines():
         if not line.strip():
             continue
-        name = line.split(':', 1)[0]
-        sessions.append({'name': name, 'raw': line})
+        parts = line.split('\t')
+        name = parts[0]
+        activity = parts[1] if len(parts) > 1 else ''
+        attached = parts[2] if len(parts) > 2 else ''
+        status = classify_tmux_status(activity, attached)
+        sessions.append({
+            'name': name,
+            'activity': activity,
+            'attached': attached == '1',
+            'status': status,
+            'raw': f'{name}: activity={activity} attached={attached == "1"} status={status}',
+        })
+    sessions.sort(key=lambda item: (0 if item['status'] == 'running' else 1, item['name']))
     return sessions
 
 
@@ -635,13 +729,15 @@ def normalize_hermes_sessions(hermes):
                     accent='reasoning',
                 ))
         timeline.sort(key=event_sort_key, reverse=True)
+        updated_at = (timeline[0]['ts'] if timeline else session.get('started_at'))
         normalized.append({
             'uid': 'hermes:' + session['id'],
             'source': 'Hermes',
             'id': session['id'],
             'title': session.get('title') or session['id'],
             'subtitle': session.get('cwd') or '',
-            'updated_at': (timeline[0]['ts'] if timeline else session.get('started_at')),
+            'updated_at': updated_at,
+            'activity_status': classify_session_status('Hermes', session, updated_at),
             'meta': {
                 'source': session.get('source'),
                 'cwd': session.get('cwd'),
@@ -727,13 +823,15 @@ def normalize_opencode_sessions(opencode):
                         accent='system',
                     ))
         timeline.sort(key=event_sort_key, reverse=True)
+        updated_at = session.get('time_updated')
         normalized.append({
             'uid': 'opencode:' + session['id'],
             'source': 'OpenCode',
             'id': session['id'],
             'title': session.get('title') or session['id'],
             'subtitle': session.get('directory') or '',
-            'updated_at': session.get('time_updated'),
+            'updated_at': updated_at,
+            'activity_status': classify_session_status('OpenCode', session, updated_at),
             'meta': {
                 'directory': session.get('directory'),
                 'agent': session.get('agent'),
@@ -854,13 +952,15 @@ def normalize_cursor_sessions(cursor):
                 accent='terminal',
             ))
         timeline.sort(key=event_sort_key, reverse=True)
+        updated_at = transcript.get('modified_at')
         normalized.append({
             'uid': 'cursor:' + transcript['session_id'],
             'source': 'Cursor',
             'id': transcript['session_id'],
             'title': transcript.get('project') or transcript['session_id'],
             'subtitle': transcript.get('path') or '',
-            'updated_at': transcript.get('modified_at'),
+            'updated_at': updated_at,
+            'activity_status': classify_session_status('Cursor', transcript, updated_at),
             'meta': {
                 'path': transcript.get('path'),
                 'project': transcript.get('project'),
@@ -877,19 +977,33 @@ def build_state():
     hermes = fetch_hermes()
     opencode = fetch_opencode()
     cursor = fetch_cursor()
+    processes = get_processes()
+    tmux_sessions = get_tmux_sessions()
     unified_sessions = (
         normalize_hermes_sessions(hermes)
         + normalize_opencode_sessions(opencode)
         + normalize_cursor_sessions(cursor)
     )
     unified_sessions.sort(key=lambda item: item.get('updated_at') or '', reverse=True)
+    process_running = sum(1 for item in processes if item.get('status') == 'running')
+    tmux_running = sum(1 for item in tmux_sessions if item.get('status') == 'running')
+    session_running = sum(1 for item in unified_sessions if item.get('activity_status') == 'running')
     return {
         'generated_at': now_iso(),
         'host': HOST,
         'port': PORT,
         'refresh_ms': REFRESH_MS,
-        'processes': get_processes(),
-        'tmux_sessions': get_tmux_sessions(),
+        'processes': processes,
+        'tmux_sessions': tmux_sessions,
+        'runtime_summary': {
+            'processes_total': len(processes),
+            'processes_running': process_running,
+            'processes_idle': len(processes) - process_running,
+            'tmux_total': len(tmux_sessions),
+            'tmux_running': tmux_running,
+            'tmux_idle': len(tmux_sessions) - tmux_running,
+            'sessions_running': session_running,
+        },
         'hermes': hermes,
         'opencode': opencode,
         'cursor': cursor,
@@ -1040,6 +1154,54 @@ INDEX_HTML = """<!doctype html>
       border-radius: 999px;
       background: var(--accent);
       box-shadow: 0 0 16px var(--accent);
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .status-badge::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: currentColor;
+    }
+    .status-running {
+      color: #9ef7df;
+      background: rgba(34, 211, 166, .12);
+      border-color: rgba(34, 211, 166, .24);
+    }
+    .status-running::before {
+      box-shadow: 0 0 10px rgba(34, 211, 166, .75);
+    }
+    .status-idle {
+      color: #cbd5e1;
+      background: rgba(148, 163, 184, .1);
+      border-color: rgba(148, 163, 184, .18);
+    }
+    .runtime-card summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      cursor: pointer;
+      list-style: none;
+    }
+    .runtime-card summary::-webkit-details-marker { display: none; }
+    .runtime-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
     }
     .action-button {
       border: 1px solid var(--line);
@@ -1579,6 +1741,12 @@ function sourceAccent(source) {
   return source || 'Agent';
 }
 
+function statusBadge(status) {
+  var normalized = String(status || 'idle').toLowerCase();
+  var label = normalized === 'running' ? 'running' : 'idle';
+  return '<span class="status-badge status-' + esc(label) + '">' + esc(label) + '</span>';
+}
+
 function filteredSessions() {
   var items = (state && state.unified_sessions) ? state.unified_sessions.slice() : [];
   if (filterSource !== 'all') items = items.filter(function(item) { return item.source === filterSource; });
@@ -1588,11 +1756,17 @@ function filteredSessions() {
 
 function renderTopbar() {
   if (!state) return;
+  var summary = state.runtime_summary || {};
   var html = '';
   html += '<span class="pill live">updated ' + esc(formatRelativeTime(state.generated_at)) + '</span>';
   html += '<span class="pill">sessions ' + esc((state.unified_sessions || []).length) + '</span>';
-  html += '<span class="pill">processes ' + esc((state.processes || []).length) + '</span>';
-  html += '<span class="pill">tmux ' + esc((state.tmux_sessions || []).length) + '</span>';
+  if (summary.sessions_running) {
+    html += '<span class="pill">' + esc(summary.sessions_running) + ' active sessions</span>';
+  }
+  html += '<span class="pill">processes ' + esc(summary.processes_total || (state.processes || []).length) +
+    ' (' + esc(summary.processes_running || 0) + ' running)</span>';
+  html += '<span class="pill">tmux ' + esc(summary.tmux_total || (state.tmux_sessions || []).length) +
+    ' (' + esc(summary.tmux_running || 0) + ' active)</span>';
   document.getElementById('topbar').innerHTML = html;
   var count = document.getElementById('sessionCount');
   if (count) count.textContent = filteredSessions().length + ' shown';
@@ -1609,7 +1783,9 @@ function renderSessionList() {
     var active = item.uid === selectedId ? ' active' : '';
     var cls = sourceClass(item.source);
     return '<div class="session-item ' + esc(cls) + active + '" data-id="' + esc(item.uid) + '">' +
-      '<div class="session-meta-row"><span class="badge ' + cls + '">' + esc(sourceAccent(item.source)) + '</span><span class="session-time">' + esc(formatRelativeTime(item.updated_at)) + '</span></div>' +
+      '<div class="session-meta-row"><span class="badge ' + cls + '">' + esc(sourceAccent(item.source)) + '</span>' +
+      statusBadge(item.activity_status) +
+      '<span class="session-time">' + esc(formatRelativeTime(item.updated_at)) + '</span></div>' +
       '<div class="session-title">' + esc(item.title) + '</div>' +
       '<div class="session-subtitle mono">' + esc(item.subtitle || item.id) + '</div>' +
       '<div class="session-preview">' + esc(stripMarkdown(item.preview || '')) + '</div>' +
@@ -1669,7 +1845,7 @@ function renderDetail() {
   var html = '';
   html += '<div class="chat-stage-inner">';
   html += '<section class="session-hero">';
-  html += '<div class="hero-top"><div><span class="badge ' + sourceClass(item.source) + '">' + esc(sourceAccent(item.source)) + '</span><h2 class="hero-title">' + esc(item.title) + '</h2><div class="sub mono hero-path">' + esc(item.subtitle || item.id) + '</div></div><div class="pill live">' + esc(formatRelativeTime(item.updated_at)) + '</div></div>';
+  html += '<div class="hero-top"><div><span class="badge ' + sourceClass(item.source) + '">' + esc(sourceAccent(item.source)) + '</span>' + statusBadge(item.activity_status) + '<h2 class="hero-title">' + esc(item.title) + '</h2><div class="sub mono hero-path">' + esc(item.subtitle || item.id) + '</div></div><div class="pill live">' + esc(formatRelativeTime(item.updated_at)) + '</div></div>';
   html += '<div class="summary-row">';
   html += '<div class="summary-chip"><strong>' + esc(userMessages) + '</strong>your messages</div>';
   html += '<div class="summary-chip"><strong>' + esc(responses) + '</strong>agent replies</div>';
@@ -1686,12 +1862,27 @@ function renderDetail() {
 
 function renderRuntime() {
   if (!state) return;
-  var html = '<div class="mini-block"><div class="mini-title">Processes</div><div class="mini-sub">Running agent-related commands</div></div>';
+  var summary = state.runtime_summary || {};
+  var html = '<div class="mini-block"><div class="mini-title">Processes</div><div class="mini-sub">Agent-related OS processes with live activity state</div>';
+  html += '<div class="runtime-summary">';
+  html += statusBadge('running') + '<span class="mini-sub">' + esc(summary.processes_running || 0) + ' active</span>';
+  html += statusBadge('idle') + '<span class="mini-sub">' + esc(summary.processes_idle || 0) + ' idle</span>';
+  html += '</div></div>';
   html += (state.processes || []).map(function(p) {
-    return '<details class="runtime-card"><summary><span class="mini-title mono">pid ' + esc(p.pid) + '</span><span class="mini-sub">cpu ' + esc(p.cpu) + ' / mem ' + esc(p.mem) + '</span></summary><div class="mini-sub">' + esc(p.started) + ' / ' + esc(p.time) + '</div><pre>' + esc(p.command) + '</pre></details>';
+    return '<details class="runtime-card"><summary>' +
+      '<span><span class="mini-title mono">pid ' + esc(p.pid) + '</span><span class="mini-sub">cpu ' + esc(p.cpu) + ' / mem ' + esc(p.mem) + ' / ' + esc(p.stat || '') + '</span></span>' +
+      statusBadge(p.status) +
+      '</summary><div class="mini-sub">' + esc(p.started) + ' / ' + esc(p.time) + '</div><pre>' + esc(p.command) + '</pre></details>';
   }).join('');
-  html += '<div class="mini-block"><div class="mini-title">tmux</div><div class="mini-sub">' + esc((state.tmux_sessions || []).length) + ' sessions</div></div>';
-  html += (state.tmux_sessions || []).map(function(t) { return '<div class="runtime-card"><div class="mini-title">' + esc(t.name || 'tmux') + '</div><pre>' + esc(t.raw) + '</pre></div>'; }).join('');
+  html += '<div class="mini-block"><div class="mini-title">tmux</div><div class="mini-sub">' + esc(summary.tmux_total || (state.tmux_sessions || []).length) + ' sessions</div>';
+  html += '<div class="runtime-summary">';
+  html += statusBadge('running') + '<span class="mini-sub">' + esc(summary.tmux_running || 0) + ' active</span>';
+  html += statusBadge('idle') + '<span class="mini-sub">' + esc(summary.tmux_idle || 0) + ' idle</span>';
+  html += '</div></div>';
+  html += (state.tmux_sessions || []).map(function(t) {
+    return '<div class="runtime-card"><div class="session-meta-row"><div><div class="mini-title">' + esc(t.name || 'tmux') + '</div><div class="mini-sub">' +
+      (t.attached ? 'attached' : 'detached') + '</div></div>' + statusBadge(t.status) + '</div><pre>' + esc(t.raw) + '</pre></div>';
+  }).join('');
   document.getElementById('runtime').innerHTML = html;
 }
 
