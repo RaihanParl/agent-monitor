@@ -17,7 +17,7 @@ CURSOR_DIR = BASE / '.cursor'
 HOST = os.environ.get('AGENT_MIRROR_HOST', '0.0.0.0')
 PORT = int(os.environ.get('AGENT_MIRROR_PORT', '8787'))
 REFRESH_MS = int(os.environ.get('AGENT_MIRROR_REFRESH_MS', '2500'))
-MAX_SESSIONS = int(os.environ.get('AGENT_MIRROR_MAX_SESSIONS', '8'))
+MAX_SESSIONS = int(os.environ.get('AGENT_MIRROR_MAX_SESSIONS', '32'))
 MAX_MESSAGES = int(os.environ.get('AGENT_MIRROR_MAX_MESSAGES', '64'))
 MAX_TERMINAL_LINES = int(os.environ.get('AGENT_MIRROR_MAX_TERMINAL_LINES', '80'))
 PROCESS_ACTIVE_CPU = float(os.environ.get('AGENT_MIRROR_PROCESS_ACTIVE_CPU', '1.0'))
@@ -730,16 +730,30 @@ def normalize_hermes_sessions(hermes):
                 ))
         timeline.sort(key=event_sort_key, reverse=True)
         updated_at = (timeline[0]['ts'] if timeline else session.get('started_at'))
+        hermes_source = session.get('source', 'cli')
+        title = session.get('title')
+        if not title:
+            for msg in session.get('messages', []):
+                text = extract_hermes_text(
+                    msg.get('content_json') if msg.get('content_json') is not None else msg.get('content')
+                )
+                if text and msg.get('role') == 'user':
+                    title = clip(text, 80)
+                    break
+                if text and msg.get('role') == 'assistant':
+                    title = clip(text, 80)
+                    break
         normalized.append({
             'uid': 'hermes:' + session['id'],
             'source': 'Hermes',
+            'hermes_source': hermes_source,
             'id': session['id'],
-            'title': session.get('title') or session['id'],
+            'title': title or session['id'],
             'subtitle': session.get('cwd') or '',
             'updated_at': updated_at,
             'activity_status': classify_session_status('Hermes', session, updated_at),
             'meta': {
-                'source': session.get('source'),
+                'source': hermes_source,
                 'cwd': session.get('cwd'),
                 'messages': session.get('message_count'),
                 'tool_calls': session.get('tool_call_count'),
@@ -1274,7 +1288,7 @@ INDEX_HTML = """<!doctype html>
     .scroll { overflow: auto; height: calc(100vh - 155px); }
     .filters {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 4px;
       padding: 4px;
       margin-top: 14px;
@@ -1644,6 +1658,7 @@ INDEX_HTML = """<!doctype html>
       <div class=\"filters\">
         <button class=\"filter active\" data-filter=\"all\">All</button>
         <button class=\"filter\" data-filter=\"Hermes\">Hermes</button>
+        <button class=\"filter\" data-filter=\"Telegram\">Telegram</button>
         <button class=\"filter\" data-filter=\"OpenCode\">OpenCode</button>
         <button class=\"filter\" data-filter=\"Cursor\">Cursor</button>
       </div>
@@ -1766,7 +1781,11 @@ function statusBadge(status) {
 
 function filteredSessions() {
   var items = (state && state.unified_sessions) ? state.unified_sessions.slice() : [];
-  if (filterSource !== 'all') items = items.filter(function(item) { return item.source === filterSource; });
+  if (filterSource === 'Telegram') {
+    items = items.filter(function(item) { return item.source === 'Hermes' && item.hermes_source === 'telegram'; });
+  } else if (filterSource !== 'all') {
+    items = items.filter(function(item) { return item.source === filterSource; });
+  }
   items.sort(function(a, b) { return String(b.updated_at || '').localeCompare(String(a.updated_at || '')); });
   return items;
 }
@@ -1801,6 +1820,7 @@ function renderSessionList() {
     var cls = sourceClass(item.source);
     return '<div class="session-item ' + esc(cls) + active + '" data-id="' + esc(item.uid) + '">' +
       '<div class="session-meta-row"><span class="badge ' + cls + '">' + esc(sourceAccent(item.source)) + '</span>' +
+      (item.hermes_source ? '<span class="badge" style="opacity:.6;font-size:9px">' + esc(item.hermes_source) + '</span>' : '') +
       statusBadge(item.activity_status) +
       '<span class="session-time">' + esc(formatRelativeTime(item.updated_at)) + '</span></div>' +
       '<div class="session-title">' + esc(item.title) + '</div>' +
